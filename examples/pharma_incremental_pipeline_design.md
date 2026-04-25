@@ -8,7 +8,7 @@
 **Raw Zone**: Azure Blob Storage (Parquet, partitioned by load date/hour)  
 **Transformation**: Azure Databricks (PySpark)  
 **Target**: Snowflake (`STG_PHARMA_SALES`, `PHARMA_SALES`)  
-**Control/Audit**: MySQL table (`pipeline_watermark_audit`) + optional stage-level log table
+**Control/Audit**: Cloud control table (`pipeline_watermark_audit` in Azure SQL/Snowflake control schema) + optional stage-level log table
 
 ---
 
@@ -16,21 +16,25 @@
 
 ### Where should the audit/watermark table live?
 
-**Recommended default: keep `pipeline_watermark_audit` in MySQL (the source system or source-side control DB).**
+**Production recommendation: do _not_ write audit/watermark state back to on-prem/source MySQL.**
 
-Why this is preferred for this pipeline:
-- ADF reads the watermark **before** extraction from MySQL, so keeping control state near the source simplifies dependency ordering.
-- Source-aligned watermarking reduces cross-system timing drift when building the incremental source query (`updated_at > last_watermark`).
-- If Snowflake is temporarily unavailable, extraction control state is still available for source-side retries.
+Use a **cloud control store** instead (for example Azure SQL DB, ADF metadata DB, or Snowflake control schema), while keeping source MySQL read-only from ADF.
 
-When to place watermark/audit in Snowflake instead:
-- You run many pipelines and want one centralized control plane in the warehouse.
-- You only advance watermark **after** Snowflake `MERGE` success and want state co-located with target commit semantics.
-- Your operations team governs orchestration metadata primarily from Snowflake.
+Why this is preferred in enterprise environments:
+- Preserves the **read-only source principle** (no control-plane writes into OLTP source).
+- Avoids additional inbound write paths to on-prem (reduced firewall/security/governance risk).
+- Separates transactional source responsibilities from pipeline orchestration metadata.
+- Easier central operations for multiple pipelines and environments (dev/test/prod).
 
-Practical compromise (common in production):
-- Keep **watermark control** in MySQL for extraction safety.
-- Also write **run observability logs** to Snowflake (or both systems) for centralized analytics.
+When MySQL-side watermark can still be acceptable:
+- Source is cloud-managed and not on-prem.
+- Security/governance explicitly allows controlled writes.
+- You own source DB operations and have clear blast-radius controls.
+
+Practical compromise (common pattern):
+- Store **watermark/control state** in Azure SQL (or Snowflake control schema).
+- Store **observability/run logs** in Snowflake for centralized analytics.
+- Keep extraction query against MySQL strictly read-only.
 
 ### Source Table (MySQL)
 
@@ -49,7 +53,7 @@ CREATE TABLE pharma_sales (
 );
 ```
 
-### Watermark Audit Table (MySQL)
+### Watermark Audit Table (MySQL, optional source-side variant)
 
 ```sql
 CREATE TABLE pipeline_watermark_audit (
@@ -79,6 +83,17 @@ CREATE TABLE pipeline_run_log (
 );
 ```
 
+### Alternative Cloud Control Table (recommended for on-prem MySQL sources)
+
+```sql
+-- Place this in Azure SQL DB (or equivalent cloud control database)
+CREATE TABLE pipeline_watermark_audit (
+    pipeline_name VARCHAR(200) PRIMARY KEY,
+    last_watermark DATETIME2 NOT NULL,
+    updated_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+```
+
 ---
 
 ## 3) ADF Pipeline Design (Step-by-Step Activities)
@@ -88,7 +103,7 @@ Pipeline name: `pl_pharma_sales_incremental`
 ### Activity Flow
 
 1. **LookupLastWatermark** (Lookup)
-   - Query `pipeline_watermark_audit` by `pipeline_name`.
+   - Query `pipeline_watermark_audit` in the **cloud control DB** by `pipeline_name`.
    - Returns `last_watermark`.
 
 2. **CopyMySQLToBlobIncremental** (Copy Activity)
@@ -113,7 +128,7 @@ Pipeline name: `pl_pharma_sales_incremental`
    - Run Snowflake `MERGE` into final table.
 
 6. **UpdateWatermark** (Stored Procedure or Script Activity)
-   - Update `pipeline_watermark_audit.last_watermark = batch_max_watermark` after successful Snowflake merge.
+   - Update control DB `pipeline_watermark_audit.last_watermark = batch_max_watermark` after successful Snowflake merge.
 
 7. **LogSuccess / LogFailure**
    - Record status per stage in `pipeline_run_log`.
